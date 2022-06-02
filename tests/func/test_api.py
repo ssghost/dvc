@@ -1,4 +1,5 @@
 import os
+from textwrap import dedent
 
 import pytest
 from funcy import first, get_in
@@ -228,3 +229,135 @@ def test_open_from_remote(tmp_dir, erepo_dir, cloud, local_cloud):
         remote="other",
     ) as fd:
         assert fd.read() == "foo content"
+
+
+@pytest.fixture
+def params_repo(tmp_dir, scm, dvc):
+    tmp_dir.gen("params.yaml", "foo: 1")
+    tmp_dir.gen("params.json", '{"bar": 2, "foobar": 3}')
+    tmp_dir.gen("other_params.json", '{"foo": {"bar": 4}}')
+
+    dvc.run(
+        name="stage-1",
+        cmd="echo stage-1",
+        params=["foo", "params.json:bar"],
+    )
+
+    dvc.run(
+        name="stage-2",
+        cmd="echo stage-2",
+        params=["other_params.json:foo"],
+    )
+
+    dvc.run(
+        name="stage-3",
+        cmd="echo stage-2",
+        params=["params.json:foobar"],
+    )
+
+    scm.add(
+        [
+            "params.yaml",
+            "params.json",
+            "other_params.json",
+            "dvc.yaml",
+            "dvc.lock",
+        ]
+    )
+    scm.commit("commit dvc files")
+
+    tmp_dir.gen("params.yaml", "foo: 5")
+    scm.add(["params.yaml"])
+    scm.commit("update params.yaml")
+
+
+def test_get_params_no_args(params_repo):
+    assert api.get_params() == {
+        "params.yaml:foo": 5,
+        "bar": 2,
+        "foobar": 3,
+        "other_params.json:foo": {"bar": 4},
+    }
+
+
+def test_get_params_targets(params_repo):
+    assert api.get_params("params.yaml") == {"foo": 5}
+    assert api.get_params("params.yaml", "params.json") == {
+        "foo": 5,
+        "bar": 2,
+        "foobar": 3,
+    }
+
+
+def test_get_params_deps(params_repo):
+    params = api.get_params(deps=True)
+    assert params == {
+        "params.yaml:foo": 5,
+        "bar": 2,
+        "foobar": 3,
+        "other_params.json:foo": {"bar": 4},
+    }
+
+
+def test_get_params_stages(params_repo):
+    assert api.get_params(stages="stage-2") == {"foo": {"bar": 4}}
+
+    assert api.get_params() == api.get_params(
+        stages=["stage-1", "stage-2", "stage-3"]
+    )
+
+    assert api.get_params("params.json", stages="stage-3") == {"foobar": 3}
+
+
+def test_get_params_revs(params_repo):
+    params_single = api.get_params(revs="HEAD~1")
+    assert params_single["HEAD~1"] == {
+        "params.yaml:foo": 1,
+        "bar": 2,
+        "foobar": 3,
+        "other_params.json:foo": {"bar": 4},
+    }
+    assert "workspace" not in params_single
+
+    params_multi = api.get_params(revs=["master", "HEAD~1"])
+    assert "workspace" not in params_multi
+    assert params_multi["master"] == api.get_params()
+    assert params_multi["HEAD~1"] == params_single["HEAD~1"]
+
+
+def test_get_params_while_running_stage(tmp_dir, dvc):
+    (tmp_dir / "params.yaml").dump({"foo": {"bar": 1}})
+    (tmp_dir / "params.json").dump({"bar": 2})
+
+    tmp_dir.gen(
+        "merge.py",
+        dedent(
+            """
+            import json
+            from dvc import api
+            with open("merged.json", "w") as f:
+                json.dump(api.get_params(stages="merge"), f)
+        """
+        ),
+    )
+    dvc.stage.add(
+        name="merge",
+        cmd="python merge.py",
+        params=["foo.bar", {"params.json": ["bar"]}],
+        outs=["merged.json"],
+    )
+
+    dvc.reproduce()
+
+    assert (tmp_dir / "merged.json").parse() == {"foo": {"bar": 1}, "bar": 2}
+
+
+def test_get_params_repo(erepo_dir):
+    with erepo_dir.chdir():
+        erepo_dir.scm_gen("params.yaml", "foo: 1", commit="Create params.yaml")
+        erepo_dir.dvc.run(
+            name="stage-1",
+            cmd="echo stage-1",
+            params=["foo"],
+        )
+    assert api.get_params(repo=erepo_dir) == {"foo": 1}
